@@ -1,0 +1,28 @@
+{
+  "productName": "SpotiRust",
+  "version": "0.1.0",
+  "identifier": "com.kif.spotirust",
+  "build": {
+    "frontendDist": "frontend"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "SpotiRust",
+        "width": 1320,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 620,
+        "center": true,
+        "backgroundColor": "#000000"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

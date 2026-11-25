@@ -1,0 +1,19 @@
+[package]
+name = "spotirust"
+version = "0.1.0"
+edition = "2024"
+description = "Spotify-inspired desktop app with Rust (Tauri v2) backend and native WebView UI"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.23"
+getrandom = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["default-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time"] }
+url = "2"

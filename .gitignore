@@ -1,0 +1,5 @@
+/target/
+/gen/
+*.log
+.DS_Store
+config.json

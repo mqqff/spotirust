@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SpotiRust</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <!-- Top Global Bar -->
+    <header class="top-bar">
+      <div class="top-left">
+        <button id="btn-menu" class="menu-dots-btn" title="Menu">
+          <span class="menu-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+        </button>
+        <button id="btn-back" class="nav-chevron" title="Go back" disabled></button>
+        <button id="btn-fwd" class="nav-chevron" title="Go forward" disabled></button>
+      </div>
+
+      <div class="top-center">
+        <button id="btn-home" class="home-pill active" title="Home"></button>
+        <div class="search-pill" id="search-pill">
+          <span class="search-icon" id="search-icon"></span>
+          <input
+            id="search-input"
+            type="text"
+            placeholder="What do you want to play?"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <div class="search-right">
+            <div id="search-keycaps" class="keycaps">
+              <kbd>Ctrl</kbd><kbd>K</kbd>
+            </div>
+            <button id="btn-clear-search" class="icon-btn hidden" title="Clear search"></button>
+            <span class="search-divider"></span>
+            <button id="btn-browse" class="icon-btn" title="Browse"></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="top-right">
+        <button id="btn-spotify-connect" class="connect-pill" title="Connect Spotify"></button>
+        <button id="btn-bell" class="icon-btn" title="What's New"></button>
+        <button id="btn-friends" class="icon-btn" title="Friend Activity"></button>
+        <button id="btn-avatar" class="avatar-ring" title="kif">
+          <span id="avatar-core" class="avatar-core">K</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- 3-Column Bento Workspace -->
+    <div class="workspace" id="workspace">
+      <!-- Left: Your Library -->
+      <aside id="sidebar-left" class="bento-card sidebar-left">
+        <div class="lib-header">
+          <button id="btn-collapse-lib" class="lib-collapse-btn" title="Collapse Your Library">
+            <span id="icon-library"></span>
+            <span class="lib-title">Your Library</span>
+          </button>
+          <button id="btn-create" class="create-pill" title="Create playlist">
+            <span id="icon-plus"></span>
+            <span class="create-label">Create</span>
+          </button>
+        </div>
+
+        <div class="lib-filters">
+          <button class="chip" data-lib-filter="playlists">Playlists</button>
+          <button class="chip" data-lib-filter="artists">Artists</button>
+        </div>
+
+        <div class="lib-subbar">
+          <span id="lib-search-icon" class="muted-icon"></span>
+          <span class="lib-sort">Recents <span id="lib-list-icon"></span></span>
+        </div>
+
+        <div id="library-list" class="scroll-area library-list"></div>
+      </aside>
+
+      <div id="resize-left" class="resize-handle" title="Drag to resize"></div>
+
+      <!-- Center: Main View -->
+      <main id="main-card" class="bento-card main-card">
+        <div id="sticky-bar" class="sticky-bar"></div>
+        <div id="main-scroll" class="scroll-area main-scroll"></div>
+      </main>
+
+      <div id="resize-right" class="resize-handle" title="Drag to resize"></div>
+
+      <!-- Right: Now Playing / Queue -->
+      <aside id="now-playing-card" class="bento-card sidebar-right">
+        <div class="np-header">
+          <span id="np-context" class="np-context">Coding Flow</span>
+          <button id="btn-close-np" class="icon-btn sm" title="Close panel"></button>
+        </div>
+        <div id="np-scroll" class="scroll-area np-scroll"></div>
+      </aside>
+    </div>
+
+    <!-- Bottom Player Bar -->
+    <footer class="player-bar">
+      <div class="player-left" id="player-left"></div>
+
+      <div class="player-center">
+        <div class="transport-row">
+          <button id="btn-shuffle" class="toggle-icon-btn" title="Shuffle"></button>
+          <button id="btn-prev" class="icon-btn" title="Previous"></button>
+          <button id="btn-play" class="play-circle" title="Play / Pause"></button>
+          <button id="btn-next" class="icon-btn" title="Next"></button>
+          <button id="btn-repeat" class="toggle-icon-btn" title="Repeat"></button>
+        </div>
+        <div class="seek-row">
+          <span id="time-elapsed" class="time-label">0:00</span>
+          <div id="seek-bar" class="range-bar" role="slider" aria-label="Seek">
+            <div class="range-track">
+              <div id="seek-fill" class="range-fill"></div>
+            </div>
+            <div id="seek-thumb" class="range-thumb"></div>
+          </div>
+          <span id="time-duration" class="time-label">0:00</span>
+        </div>
+      </div>
+
+      <div class="player-right">
+        <button id="btn-lyrics" class="toggle-icon-btn" title="Lyrics"></button>
+        <button id="btn-queue" class="toggle-icon-btn" title="Queue"></button>
+        <button id="btn-devices" class="toggle-icon-btn" title="Connect to a device"></button>
+        <button id="btn-np" class="toggle-icon-btn active" title="Now Playing View"></button>
+        <button id="btn-volume" class="icon-btn" title="Mute / Unmute"></button>
+        <div id="volume-bar" class="range-bar volume-bar" role="slider" aria-label="Volume">
+          <div class="range-track">
+            <div id="volume-fill" class="range-fill"></div>
+          </div>
+          <div id="volume-thumb" class="range-thumb"></div>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Floating Popover / Dropdown Layer & Modal & Toast -->
+  <div id="popover" class="popover hidden"></div>
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div id="modal-box" class="modal-box"></div>
+  </div>
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
