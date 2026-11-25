@@ -1,18 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
 mod data;
 mod spotify;
 
 use std::sync::Mutex;
 
+use audio::AudioEngine;
 use data::{AppState, StateSnapshot};
-use spotify::{LocalConfig, SoloistManager, SpotifyClient};
+use spotify::{LocalConfig, SpotifyClient};
 use tauri::State;
 
 struct Backend {
     state: Mutex<AppState>,
     cfg: Mutex<LocalConfig>,
-    soloist: Mutex<SoloistManager>,
+    audio: tokio::sync::Mutex<AudioEngine>,
     client: SpotifyClient,
 }
 
@@ -21,31 +23,31 @@ impl Backend {
         let cfg = LocalConfig::load();
         let mut state = AppState::default();
         state.spotify.client_id = cfg.client_id.clone();
-        state.spotify.soloist_has_key = !cfg.soloist_api_key.trim().is_empty();
-        state.spotify.soloist_bin = cfg.soloist_bin.clone();
-        state.spotify.soloist_bin_found = SoloistManager::find_binary(&cfg.soloist_bin).is_some();
+        state.spotify.audio_cached = AudioEngine::has_cached_credentials();
         Self {
             state: Mutex::new(state),
             cfg: Mutex::new(cfg),
-            soloist: Mutex::new(SoloistManager::default()),
+            audio: tokio::sync::Mutex::new(AudioEngine::default()),
             client: SpotifyClient::default(),
         }
     }
 
-    fn refresh_local_status(&self) {
-        let cfg = self.cfg.lock().unwrap().clone();
-        let running = self.soloist.lock().unwrap().is_running();
+    async fn snapshot_async(&self) -> StateSnapshot {
+        let running = self.audio.lock().await.is_running();
+        let cfg_client_id = self.cfg.lock().unwrap().client_id.clone();
         let mut st = self.state.lock().unwrap();
-        st.spotify.client_id = cfg.client_id;
-        st.spotify.soloist_running = running;
-        st.spotify.soloist_has_key = !cfg.soloist_api_key.trim().is_empty();
-        st.spotify.soloist_bin_found = SoloistManager::find_binary(&cfg.soloist_bin).is_some();
-        st.spotify.soloist_bin = cfg.soloist_bin;
+        st.spotify.client_id = cfg_client_id;
+        st.spotify.audio_running = running;
+        st.spotify.audio_cached = AudioEngine::has_cached_credentials();
+        st.snapshot()
     }
 
-    fn snapshot(&self) -> StateSnapshot {
-        self.refresh_local_status();
-        self.state.lock().unwrap().snapshot()
+    fn snapshot_sync(&self) -> StateSnapshot {
+        let cfg_client_id = self.cfg.lock().unwrap().client_id.clone();
+        let mut st = self.state.lock().unwrap();
+        st.spotify.client_id = cfg_client_id;
+        st.spotify.audio_cached = AudioEngine::has_cached_credentials();
+        st.snapshot()
     }
 
     fn set_error(&self, err: Option<String>) {
@@ -97,27 +99,20 @@ impl Backend {
 
 #[tauri::command]
 fn get_state(backend: State<'_, Backend>) -> StateSnapshot {
-    backend.snapshot()
+    backend.snapshot_sync()
 }
 
 #[tauri::command]
 async fn spotify_bootstrap(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
-    let cfg = backend.cfg.lock().unwrap().clone();
-    if !cfg.soloist_api_key.trim().is_empty()
-        && SoloistManager::find_binary(&cfg.soloist_bin).is_some()
-    {
-        let _ = backend
-            .soloist
-            .lock()
-            .unwrap()
-            .start(&cfg.soloist_api_key, &cfg.soloist_bin);
+    if AudioEngine::has_cached_credentials() {
+        let _ = backend.audio.lock().await.start(false).await;
     }
     if let Some(tok) = backend.token_if_connected().await {
         if let Err(e) = backend.sync_full_library(&tok).await {
             backend.set_error(Some(e));
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -128,27 +123,21 @@ async fn spotify_login(backend: State<'_, Backend>) -> Result<StateSnapshot, Str
         return Err(e);
     }
     let tok = cfg.access_token.clone().unwrap_or_default();
-    *backend.cfg.lock().unwrap() = cfg.clone();
+    *backend.cfg.lock().unwrap() = cfg;
 
-    if !cfg.soloist_api_key.trim().is_empty()
-        && SoloistManager::find_binary(&cfg.soloist_bin).is_some()
-    {
-        let _ = backend
-            .soloist
-            .lock()
-            .unwrap()
-            .start(&cfg.soloist_api_key, &cfg.soloist_bin);
+    if AudioEngine::has_cached_credentials() {
+        let _ = backend.audio.lock().await.start(false).await;
     }
 
     if let Err(e) = backend.sync_full_library(&tok).await {
         backend.set_error(Some(e.clone()));
         return Err(e);
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
-fn spotify_logout(backend: State<'_, Backend>) -> StateSnapshot {
+async fn spotify_logout(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
     {
         let mut cfg = backend.cfg.lock().unwrap();
         cfg.access_token = None;
@@ -156,47 +145,48 @@ fn spotify_logout(backend: State<'_, Backend>) -> StateSnapshot {
         cfg.expires_at = 0;
         let _ = cfg.save();
     }
-    backend.soloist.lock().unwrap().stop();
+    backend.audio.lock().await.clear_cache();
     backend.state.lock().unwrap().reset_to_dummy();
-    backend.snapshot()
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
-fn spotify_save_settings(
+async fn spotify_save_settings(
     backend: State<'_, Backend>,
     client_id: String,
-    soloist_api_key: String,
-    soloist_bin: String,
 ) -> Result<StateSnapshot, String> {
     {
         let mut cfg = backend.cfg.lock().unwrap();
         if !client_id.trim().is_empty() {
             cfg.client_id = client_id.trim().to_string();
         }
-        if !soloist_api_key.trim().is_empty() {
-            cfg.soloist_api_key = soloist_api_key.trim().to_string();
-        }
-        cfg.soloist_bin = soloist_bin.trim().to_string();
         cfg.save()?;
     }
     backend.set_error(None);
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
-fn soloist_toggle(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
-    let cfg = backend.cfg.lock().unwrap().clone();
-    let mut mgr = backend.soloist.lock().unwrap();
-    if mgr.is_running() {
-        mgr.stop();
-    } else if let Err(e) = mgr.start(&cfg.soloist_api_key, &cfg.soloist_bin) {
-        drop(mgr);
-        backend.set_error(Some(e.clone()));
-        return Err(e);
+async fn audio_toggle(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
+    let mut eng = backend.audio.lock().await;
+    if eng.is_running() {
+        eng.stop();
+        drop(eng);
+        backend.set_error(None);
+    } else {
+        let res = eng.start(true).await;
+        drop(eng);
+        if let Err(e) = res {
+            backend.set_error(Some(e.clone()));
+            return Err(e);
+        }
+        backend.set_error(None);
+        if let Some(tok) = backend.token_if_connected().await {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            backend.sync_player_only(&tok).await;
+        }
     }
-    drop(mgr);
-    backend.set_error(None);
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -204,7 +194,7 @@ async fn spotify_sync_player(backend: State<'_, Backend>) -> Result<StateSnapsho
     if let Some(tok) = backend.token_if_connected().await {
         backend.sync_player_only(&tok).await;
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -235,7 +225,7 @@ async fn spotify_load_playlist(
             Err(e) => backend.set_error(Some(e)),
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -252,7 +242,7 @@ async fn spotify_search(
             Err(e) => backend.set_error(Some(e)),
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -269,7 +259,7 @@ async fn spotify_transfer_device(
             Err(e) => backend.set_error(Some(e)),
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -301,7 +291,7 @@ async fn play_in_context(
             }
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -311,6 +301,16 @@ async fn toggle_play(backend: State<'_, Backend>) -> Result<StateSnapshot, Strin
         st.toggle_play();
         st.is_playing
     };
+    {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() {
+            if now_playing {
+                eng.play();
+            } else {
+                eng.pause();
+            }
+        }
+    }
     if let Some(tok) = backend.token_if_connected().await {
         let res = if now_playing {
             backend.client.resume(&tok).await
@@ -326,7 +326,7 @@ async fn toggle_play(backend: State<'_, Backend>) -> Result<StateSnapshot, Strin
             backend.set_error(None);
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -340,7 +340,7 @@ async fn next_track(backend: State<'_, Backend>) -> Result<StateSnapshot, String
             backend.sync_player_only(&tok).await;
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -354,7 +354,7 @@ async fn prev_track(backend: State<'_, Backend>) -> Result<StateSnapshot, String
             backend.sync_player_only(&tok).await;
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -367,7 +367,7 @@ async fn seek_ratio(backend: State<'_, Backend>, ratio: f32) -> Result<StateSnap
     if let Some(tok) = backend.token_if_connected().await {
         let _ = backend.client.seek(&tok, ms).await;
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -380,7 +380,7 @@ async fn seek_secs(backend: State<'_, Backend>, secs: f32) -> Result<StateSnapsh
     if let Some(tok) = backend.token_if_connected().await {
         let _ = backend.client.seek(&tok, ms).await;
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -393,7 +393,7 @@ async fn toggle_shuffle(backend: State<'_, Backend>) -> Result<StateSnapshot, St
     if let Some(tok) = backend.token_if_connected().await {
         let _ = backend.client.set_shuffle(&tok, enabled).await;
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -406,37 +406,49 @@ async fn cycle_repeat(backend: State<'_, Backend>) -> Result<StateSnapshot, Stri
     if let Some(tok) = backend.token_if_connected().await {
         let _ = backend.client.set_repeat(&tok, mode.as_spotify_str()).await;
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
 async fn set_volume(backend: State<'_, Backend>, volume: f32) -> Result<StateSnapshot, String> {
-    let pct = {
+    let (vol, pct) = {
         let mut st = backend.state.lock().unwrap();
         st.set_volume(volume);
-        (st.volume * 100.0).round() as u8
+        (st.volume, (st.volume * 100.0).round() as u8)
     };
+    {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() {
+            eng.set_volume_ratio(vol);
+        }
+    }
     if let Some(tok) = backend.token_if_connected().await {
         let _ = backend.client.set_volume(&tok, pct).await;
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
 async fn toggle_mute(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
-    let pct = {
+    let (vol, pct) = {
         let mut st = backend.state.lock().unwrap();
         st.toggle_mute();
         if st.muted {
-            0
+            (0.0, 0)
         } else {
-            (st.volume * 100.0).round() as u8
+            (st.volume, (st.volume * 100.0).round() as u8)
         }
     };
+    {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() {
+            eng.set_volume_ratio(vol);
+        }
+    }
     if let Some(tok) = backend.token_if_connected().await {
         let _ = backend.client.set_volume(&tok, pct).await;
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -444,20 +456,16 @@ async fn toggle_like(backend: State<'_, Backend>, track_id: usize) -> Result<Sta
     let remote = {
         let mut st = backend.state.lock().unwrap();
         st.toggle_like(track_id);
-        st.tracks.get(track_id).and_then(|t| {
-            Some((
-                t.uri.clone()?,
-                t.spotify_id.clone()?,
-                t.liked,
-            ))
-        })
+        st.tracks
+            .get(track_id)
+            .and_then(|t| Some((t.uri.clone()?, t.spotify_id.clone()?, t.liked)))
     };
     if let (Some((uri, sid, liked)), Some(tok)) = (remote, backend.token_if_connected().await) {
         if let Err(e) = backend.client.set_track_liked(&tok, &uri, &sid, liked).await {
             backend.set_error(Some(e));
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -470,7 +478,7 @@ async fn jump_queue(backend: State<'_, Backend>, idx: usize) -> Result<StateSnap
     if let (Some(u), Some(tok)) = (uri, backend.token_if_connected().await) {
         let _ = backend.client.play_uris(&tok, vec![u], None).await;
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -487,7 +495,7 @@ async fn create_playlist(backend: State<'_, Backend>, name: String) -> Result<St
             Err(e) => backend.set_error(Some(e)),
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -499,20 +507,22 @@ async fn rename_playlist(
     let sp_id = {
         let mut st = backend.state.lock().unwrap();
         st.rename_playlist(playlist_idx, name.clone());
-        st.playlists.get(playlist_idx).and_then(|p| p.spotify_id.clone())
+        st.playlists
+            .get(playlist_idx)
+            .and_then(|p| p.spotify_id.clone())
     };
     if let (Some(pid), Some(tok)) = (sp_id, backend.token_if_connected().await) {
         if let Err(e) = backend.client.rename_playlist(&tok, &pid, name.trim()).await {
             backend.set_error(Some(e));
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
 fn delete_playlist(backend: State<'_, Backend>, playlist_idx: usize) -> StateSnapshot {
     backend.state.lock().unwrap().delete_playlist(playlist_idx);
-    backend.snapshot()
+    backend.snapshot_sync()
 }
 
 #[tauri::command]
@@ -533,7 +543,7 @@ async fn add_track_to_playlist(
             backend.set_error(Some(e));
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -558,7 +568,7 @@ async fn remove_track_from_playlist(
             backend.set_error(Some(e));
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
@@ -573,19 +583,19 @@ async fn add_to_queue(backend: State<'_, Backend>, track_id: usize) -> Result<St
             backend.set_error(Some(e));
         }
     }
-    Ok(backend.snapshot())
+    Ok(backend.snapshot_async().await)
 }
 
 #[tauri::command]
 fn remove_from_queue(backend: State<'_, Backend>, idx: usize) -> StateSnapshot {
     backend.state.lock().unwrap().remove_from_queue(idx);
-    backend.snapshot()
+    backend.snapshot_sync()
 }
 
 #[tauri::command]
 fn clear_queue(backend: State<'_, Backend>) -> StateSnapshot {
     backend.state.lock().unwrap().clear_queue();
-    backend.snapshot()
+    backend.snapshot_sync()
 }
 
 fn main() {
@@ -597,7 +607,7 @@ fn main() {
             spotify_login,
             spotify_logout,
             spotify_save_settings,
-            soloist_toggle,
+            audio_toggle,
             spotify_sync_player,
             spotify_load_playlist,
             spotify_search,

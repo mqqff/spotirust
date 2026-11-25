@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -26,10 +26,6 @@ pub struct LocalConfig {
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub expires_at: u64,
-    #[serde(default)]
-    pub soloist_api_key: String,
-    #[serde(default)]
-    pub soloist_bin: String,
 }
 
 fn default_client_id() -> String {
@@ -43,8 +39,6 @@ impl Default for LocalConfig {
             access_token: None,
             refresh_token: None,
             expires_at: 0,
-            soloist_api_key: String::new(),
-            soloist_bin: String::new(),
         }
     }
 }
@@ -133,125 +127,6 @@ pub struct RemotePlayer {
     pub volume: f32,
     pub device_name: Option<String>,
     pub track: Option<RemoteTrack>,
-}
-
-pub struct SoloistManager {
-    child: Option<Child>,
-}
-
-impl Default for SoloistManager {
-    fn default() -> Self {
-        Self { child: None }
-    }
-}
-
-impl Drop for SoloistManager {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-impl SoloistManager {
-    pub fn find_binary(configured: &str) -> Option<PathBuf> {
-        let bin_name = if cfg!(target_os = "windows") {
-            "soloist.exe"
-        } else {
-            "soloist"
-        };
-        let trimmed = configured.trim();
-        if !trimmed.is_empty() {
-            let p = PathBuf::from(trimmed);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let beside = dir.join(bin_name);
-                if beside.is_file() {
-                    return Some(beside);
-                }
-            }
-        }
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            let local = PathBuf::from(home).join(".local/bin").join(bin_name);
-            if local.is_file() {
-                return Some(local);
-            }
-        }
-        if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
-            let p = PathBuf::from(local_app).join("soloist").join(bin_name);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-        let usr_local = PathBuf::from("/usr/local/bin").join(bin_name);
-        if usr_local.is_file() {
-            return Some(usr_local);
-        }
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                let candidate = dir.join(bin_name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
-    }
-
-    pub fn is_running(&mut self) -> bool {
-        if let Some(child) = self.child.as_mut() {
-            match child.try_wait() {
-                Ok(None) => true,
-                _ => {
-                    self.child = None;
-                    false
-                }
-            }
-        } else {
-            false
-        }
-    }
-
-    pub fn start(&mut self, api_key: &str, configured_bin: &str) -> Result<(), String> {
-        if self.is_running() {
-            return Ok(());
-        }
-        let key = api_key.trim();
-        if key.is_empty() {
-            return Err("Soloist API Key belum diisi.".into());
-        }
-        let bin = Self::find_binary(configured_bin).ok_or_else(|| {
-            if cfg!(target_os = "windows") {
-                "Binary `soloist.exe` belum ditemukan. Taruh di folder yang sama dengan spotirust.exe atau isi path-nya di Settings.".to_string()
-            } else {
-                "Binary `soloist` belum ditemukan. Taruh di ~/.local/bin/soloist atau /usr/local/bin/soloist.".to_string()
-            }
-        })?;
-        let mut cmd = Command::new(bin);
-        cmd.args(["--device-name", "SpotiRust", "--api-key", key])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("Gagal menjalankan soloist: {e}"))?;
-        self.child = Some(child);
-        Ok(())
-    }
-
-    pub fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
 }
 
 pub struct SpotifyClient {
@@ -826,8 +701,8 @@ impl SpotifyClient {
         let devices = self.fetch_devices(token).await.ok()?;
         devices
             .iter()
-            .find(|d| d.is_active)
-            .or_else(|| devices.iter().find(|d| d.name.eq_ignore_ascii_case("SpotiRust")))
+            .find(|d| d.name.eq_ignore_ascii_case("SpotiRust"))
+            .or_else(|| devices.iter().find(|d| d.is_active))
             .or_else(|| devices.first())
             .map(|d| d.id.clone())
     }
@@ -864,7 +739,7 @@ impl SpotifyClient {
                 }
                 return Ok(());
             }
-            return Err("Tidak ada device Spotify aktif. Jalankan Soloist atau buka Spotify di HP/Web dulu.".into());
+            return Err("Tidak ada device Spotify aktif. Aktifkan Built-in Speaker di ikon Device atau buka Spotify di HP/Web.".into());
         }
         if status >= 400 {
             return Err(extract_api_error(status, &val));

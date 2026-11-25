@@ -181,9 +181,9 @@ function renderTopBar() {
   const sp = snap.spotify;
   connBtn.classList.toggle("connected", sp.connected);
   if (sp.connected) {
-    const label = sp.active_device || (sp.soloist_running ? "SpotiRust" : "Spotify");
+    const label = sp.active_device || (sp.audio_running ? "SpotiRust" : "Spotify");
     connBtn.innerHTML = `<span class="status-dot"></span><span>${esc(label)}</span>`;
-    connBtn.title = "Spotify Connected • Switch device";
+    connBtn.title = "Spotify Connected • Switch device / Built-in audio";
   } else {
     connBtn.innerHTML = `${ICONS.spotify(15)}<span>${ui.loginBusy ? "Connecting..." : "Log in"}</span>`;
     connBtn.title = "Login with Spotify";
@@ -699,7 +699,7 @@ function renderPlayerBar() {
 
   document.getElementById("btn-lyrics").classList.toggle("active", ui.view.kind === "lyrics");
   document.getElementById("btn-queue").classList.toggle("active", ui.rightPanel === "queue");
-  document.getElementById("btn-devices").classList.toggle("active", Boolean(snap.spotify.active_device || snap.spotify.soloist_running));
+  document.getElementById("btn-devices").classList.toggle("active", Boolean(snap.spotify.active_device || snap.spotify.audio_running));
   document.getElementById("btn-np").classList.toggle("active", ui.rightPanel === "now_playing");
 
   const effVol = snap.muted ? 0 : snap.volume;
@@ -1031,21 +1031,25 @@ function openDevicesPopover(anchorEl, alignRight = true) {
           </button>`
         )
         .join("")
-    : `<div style="padding:10px 12px;font-size:12.5px;color:var(--text-secondary);">Belum ada device Spotify aktif. Jalankan Soloist atau buka Spotify di HP/Web.</div>`;
+    : `<div style="padding:10px 12px;font-size:12.5px;color:var(--text-secondary);">Belum ada device Spotify aktif. Aktifkan Built-in Speaker di bawah untuk memutar langsung dari PC ini.</div>`;
 
   openPopover(
     "devices",
     anchorEl,
     `
     <div class="pop-header">Connect to a device</div>
+    <button class="pop-item" data-pop-cmd="toggle-audio">
+      <div>
+        <div style="font-weight:700;color:${sp.audio_running ? "var(--green)" : "var(--text-primary)"};">Built-in Speaker (SpotiRust)</div>
+        <div style="font-size:11px;color:var(--text-secondary);">${sp.audio_running ? "Active • Klik untuk matikan" : "Klik untuk nyalakan audio di PC ini"}</div>
+      </div>
+      <span class="pop-shortcut">${sp.audio_running ? "ON" : "OFF"}</span>
+    </button>
+    <div class="pop-divider"></div>
     ${devItems}
     <div class="pop-divider"></div>
-    <button class="pop-item" data-pop-cmd="toggle-soloist">
-      <span>${sp.soloist_running ? "Stop Soloist Speaker" : "Start Soloist Speaker"}</span>
-      <span class="pop-shortcut">${sp.soloist_running ? "ON" : "OFF"}</span>
-    </button>
     <button class="pop-item" data-pop-cmd="sync-devices"><span>Refresh devices</span></button>
-    <button class="pop-item" data-pop-cmd="settings"><span>Spotify &amp; Soloist Setup</span></button>`,
+    <button class="pop-item" data-pop-cmd="settings"><span>Spotify &amp; Audio Setup</span></button>`,
     alignRight
   );
 }
@@ -1054,7 +1058,7 @@ function showApiSettingsModal() {
   const sp = snap.spotify;
   openModal(`
     <div class="modal-hdr">
-      <div class="modal-title">Spotify API &amp; Soloist Setup</div>
+      <div class="modal-title">Spotify &amp; Built-in Audio Setup</div>
       <button class="icon-btn sm" data-close-modal>${ICONS.close(15)}</button>
     </div>
 
@@ -1067,21 +1071,16 @@ function showApiSettingsModal() {
     <input id="cfg-client-id" class="modal-input" type="text" value="${esc(sp.client_id)}" placeholder="Client ID dari Developer Dashboard" style="margin-bottom:8px;" />
     <div class="shortcut-row" style="margin-bottom:8px;"><span>Redirect URI</span><span class="pop-shortcut">http://127.0.0.1:8888/callback</span></div>
 
-    <div class="modal-section-hdr">Spotify Soloist (Audio Speaker Lokal)</div>
+    <div class="modal-section-hdr">Built-in Audio Speaker (librespot)</div>
     <div class="status-row">
-      <span>Soloist Binary</span>
-      <span class="status-badge ${sp.soloist_bin_found ? "ok" : "warn"}">${sp.soloist_bin_found ? "Found" : "Not found (taruh di sebelah app / ~/.local/bin)"}</span>
+      <span>Audio Engine</span>
+      <span class="status-badge ${sp.audio_running ? "ok" : sp.audio_cached ? "" : "warn"}">${
+        sp.audio_running ? "Running (Device: SpotiRust)" : sp.audio_cached ? "Stopped (Saved)" : "Not enabled"
+      }</span>
     </div>
-    <div class="status-row">
-      <span>Soloist Status</span>
-      <span class="status-badge ${sp.soloist_running ? "ok" : ""}">${sp.soloist_running ? "Running (Device: SpotiRust)" : "Stopped"}</span>
-    </div>
-
-    <label class="modal-label" for="cfg-soloist-key">Soloist API Key ${sp.soloist_has_key ? "(sudah tersimpan)" : "(opsional)"}</label>
-    <input id="cfg-soloist-key" class="modal-input" type="password" placeholder="${sp.soloist_has_key ? "Tersimpan — isi untuk mengganti" : "Paste Soloist API Key kamu"}" style="margin-bottom:8px;" />
-
-    <label class="modal-label" for="cfg-soloist-bin">Path Binary Soloist (opsional)</label>
-    <input id="cfg-soloist-bin" class="modal-input" type="text" value="${esc(sp.soloist_bin || "")}" placeholder="Otomatis: ~/.local/bin/soloist" style="margin-bottom:14px;" />
+    <p class="modal-desc" style="margin-bottom:14px;">
+      Putar audio Spotify langsung dari speaker PC ini tanpa aplikasi Spotify lain atau download tambahan (butuh akun Spotify Premium).
+    </p>
 
     <div class="modal-actions" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">
       <div style="display:flex;gap:8px;">
@@ -1090,28 +1089,28 @@ function showApiSettingsModal() {
             ? `<button class="btn-danger" id="btn-modal-logout">Disconnect</button>`
             : `<button class="btn-primary" id="btn-modal-login">Login with Spotify</button>`
         }
-        <button class="btn-secondary" id="btn-modal-soloist">${sp.soloist_running ? "Stop Soloist" : "Start Soloist"}</button>
+        <button class="btn-secondary" id="btn-modal-audio">${sp.audio_running ? "Stop Audio" : "Enable Built-in Audio"}</button>
       </div>
-      <button class="btn-secondary" id="btn-modal-save">Save Settings</button>
+      <button class="btn-secondary" id="btn-modal-save">Save Client ID</button>
     </div>`);
 
   const saveCfg = async (silent = false) => {
     const clientId = document.getElementById("cfg-client-id").value;
-    const soloistApiKey = document.getElementById("cfg-soloist-key").value;
-    const soloistBin = document.getElementById("cfg-soloist-bin").value;
-    const ok = await callBackend("spotify_save_settings", { clientId, soloistApiKey, soloistBin });
-    if (ok && !silent) showToast("Pengaturan tersimpan di ~/.config/spotirust/config.json");
+    const ok = await callBackend("spotify_save_settings", { clientId });
+    if (ok && !silent) showToast("Client ID tersimpan");
     return ok;
   };
 
   document.getElementById("btn-modal-save").addEventListener("click", async () => {
     if (await saveCfg(false)) showApiSettingsModal();
   });
-  document.getElementById("btn-modal-soloist").addEventListener("click", async () => {
-    await saveCfg(true);
-    const ok = await callBackend("soloist_toggle");
+  document.getElementById("btn-modal-audio").addEventListener("click", async () => {
+    if (!snap.spotify.audio_running) {
+      showToast(snap.spotify.audio_cached ? "Menyalakan Built-in Speaker..." : "Membuka browser untuk otorisasi Built-in Speaker...");
+    }
+    const ok = await callBackend("audio_toggle");
     if (ok) {
-      showToast(snap.spotify.soloist_running ? 'Soloist aktif! Pilih device "SpotiRust".' : "Soloist dihentikan");
+      showToast(snap.spotify.audio_running ? 'Built-in Speaker "SpotiRust" aktif!' : "Built-in Speaker dimatikan");
       showApiSettingsModal();
     }
   });
@@ -1277,7 +1276,7 @@ function wireEvents() {
       </div>
       <div class="pop-divider"></div>
       <button class="pop-item" data-pop-cmd="profile"><span>Profile</span></button>
-      <button class="pop-item" data-pop-cmd="settings"><span>Spotify &amp; Soloist Setup</span></button>
+      <button class="pop-item" data-pop-cmd="settings"><span>Spotify &amp; Audio Setup</span></button>
       <button class="pop-item" data-pop-cmd="shortcuts"><span>Keyboard Shortcuts</span></button>
       <div class="pop-divider"></div>
       ${
@@ -1347,9 +1346,12 @@ function wireEvents() {
           renderAll();
           showToast("Akun Spotify diputus (kembali ke Demo Mode)");
         });
-      } else if (cmd === "toggle-soloist") {
-        callBackend("soloist_toggle").then((ok) => {
-          if (ok) showToast(snap.spotify.soloist_running ? 'Soloist aktif! Device "SpotiRust" siap.' : "Soloist dihentikan");
+      } else if (cmd === "toggle-audio") {
+        if (!snap.spotify.audio_running) {
+          showToast(snap.spotify.audio_cached ? "Menyalakan Built-in Speaker..." : "Membuka browser untuk otorisasi Built-in Speaker...");
+        }
+        callBackend("audio_toggle").then((ok) => {
+          if (ok) showToast(snap.spotify.audio_running ? 'Built-in Speaker "SpotiRust" aktif!' : "Built-in Speaker dimatikan");
         });
       } else if (cmd === "sync-devices") {
         callBackend("spotify_sync_player").then(() => showToast("Daftar device diperbarui"));

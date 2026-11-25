@@ -90,7 +90,7 @@ pub struct Artist {
     pub accent_rgb: [u8; 3],
 }
 
-/// Live Spotify & Soloist connection status exposed to frontend.
+/// Live Spotify & built-in audio engine status exposed to frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct SpotifyStatus {
     pub connected: bool,
@@ -99,10 +99,8 @@ pub struct SpotifyStatus {
     pub client_id: String,
     pub active_device: Option<String>,
     pub devices: Vec<DeviceInfo>,
-    pub soloist_running: bool,
-    pub soloist_has_key: bool,
-    pub soloist_bin_found: bool,
-    pub soloist_bin: String,
+    pub audio_running: bool,
+    pub audio_cached: bool,
     pub last_error: Option<String>,
 }
 
@@ -115,10 +113,8 @@ impl Default for SpotifyStatus {
             client_id: DEFAULT_CLIENT_ID.into(),
             active_device: None,
             devices: Vec::new(),
-            soloist_running: false,
-            soloist_has_key: false,
-            soloist_bin_found: false,
-            soloist_bin: String::new(),
+            audio_running: false,
+            audio_cached: false,
             last_error: None,
         }
     }
@@ -235,14 +231,8 @@ impl AppState {
 
     pub fn reset_to_dummy(&mut self) {
         let keep_client_id = self.spotify.client_id.clone();
-        let keep_soloist_key = self.spotify.soloist_has_key;
-        let keep_soloist_bin_found = self.spotify.soloist_bin_found;
-        let keep_soloist_bin = self.spotify.soloist_bin.clone();
         *self = Self::default();
         self.spotify.client_id = keep_client_id;
-        self.spotify.soloist_has_key = keep_soloist_key;
-        self.spotify.soloist_bin_found = keep_soloist_bin_found;
-        self.spotify.soloist_bin = keep_soloist_bin;
     }
 
     pub fn upsert_remote_track(&mut self, rt: RemoteTrack, mark_liked: Option<bool>) -> usize {
