@@ -6,6 +6,8 @@ mod lyrics;
 mod spotify;
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use audio::AudioEngine;
 use data::{AppState, StateSnapshot};
@@ -19,6 +21,8 @@ struct Backend {
     audio: tokio::sync::Mutex<AudioEngine>,
     client: SpotifyClient,
     lyrics: LyricsClient,
+    last_user_action: Mutex<Option<Instant>>,
+    poll_count: AtomicU64,
 }
 
 impl Backend {
@@ -33,7 +37,20 @@ impl Backend {
             audio: tokio::sync::Mutex::new(AudioEngine::default()),
             client: SpotifyClient::default(),
             lyrics: LyricsClient::default(),
+            last_user_action: Mutex::new(None),
+            poll_count: AtomicU64::new(0),
         }
+    }
+
+    fn mark_user_action(&self) {
+        *self.last_user_action.lock().unwrap() = Some(Instant::now());
+    }
+
+    fn recent_user_action(&self, window: Duration) -> bool {
+        self.last_user_action
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t.elapsed() < window)
     }
 
     async fn snapshot_async(&self) -> StateSnapshot {
@@ -77,16 +94,27 @@ impl Backend {
 
     async fn sync_full_library(&self, token: &str) -> Result<(), String> {
         let profile = self.client.fetch_profile(token).await?;
-        let playlists = self.client.fetch_playlists(token).await.unwrap_or_default();
-        let liked = self.client.fetch_liked_tracks(token).await.unwrap_or_default();
-        let recent = self.client.fetch_recently_played(token).await.unwrap_or_default();
-        let player = self.client.fetch_player(token).await.ok().flatten();
-        let queue = self.client.fetch_queue(token).await.unwrap_or_default();
-        let devices = self.client.fetch_devices(token).await.unwrap_or_default();
+        let (playlists, liked, recent, player, queue, devices) = tokio::join!(
+            self.client.fetch_playlists(token),
+            self.client.fetch_liked_tracks(token),
+            self.client.fetch_recently_played(token),
+            self.client.fetch_player(token),
+            self.client.fetch_queue(token),
+            self.client.fetch_devices(token),
+        );
 
         let mut st = self.state.lock().unwrap();
-        st.load_spotify_library(profile, playlists, liked, recent);
-        st.apply_remote_player(player, queue, devices);
+        st.load_spotify_library(
+            profile,
+            playlists.unwrap_or_default(),
+            liked.unwrap_or_default(),
+            recent.unwrap_or_default(),
+        );
+        st.apply_remote_player(
+            player.ok().flatten(),
+            queue.unwrap_or_default(),
+            devices.unwrap_or_default(),
+        );
         Ok(())
     }
 
@@ -98,13 +126,16 @@ impl Backend {
     }
 
     async fn sync_player_only(&self, token: &str) {
-        let player = self.client.fetch_player(token).await.ok().flatten();
-        let queue = self.client.fetch_queue(token).await.unwrap_or_default();
-        let devices = self.client.fetch_devices(token).await.unwrap_or_default();
-        self.state
-            .lock()
-            .unwrap()
-            .apply_remote_player(player, queue, devices);
+        let (player, queue, devices) = tokio::join!(
+            self.client.fetch_player(token),
+            self.client.fetch_queue(token),
+            self.client.fetch_devices(token),
+        );
+        self.state.lock().unwrap().apply_remote_player(
+            player.ok().flatten(),
+            queue.unwrap_or_default(),
+            devices.unwrap_or_default(),
+        );
     }
 }
 
@@ -210,8 +241,40 @@ async fn audio_toggle(backend: State<'_, Backend>) -> Result<StateSnapshot, Stri
 
 #[tauri::command]
 async fn spotify_sync_player(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
+    if backend.recent_user_action(Duration::from_millis(1800)) {
+        return Ok(backend.snapshot_async().await);
+    }
+    let started_at = Instant::now();
     if let Some(tok) = backend.token_if_connected().await {
-        backend.sync_player_only(&tok).await;
+        let player = backend.client.fetch_player(&tok).await.ok().flatten();
+        // Discard stale poll if user clicked play/pause/skip while request was in flight
+        if backend
+            .last_user_action
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t >= started_at || t.elapsed() < Duration::from_millis(1800))
+        {
+            return Ok(backend.snapshot_async().await);
+        }
+        let track_changed = backend
+            .state
+            .lock()
+            .unwrap()
+            .apply_remote_player_fast(player.clone());
+        let n = backend.poll_count.fetch_add(1, Ordering::Relaxed);
+        if track_changed || n % 4 == 0 {
+            let (queue, devices) = tokio::join!(
+                backend.client.fetch_queue(&tok),
+                backend.client.fetch_devices(&tok),
+            );
+            if !backend.recent_user_action(Duration::from_millis(1800)) {
+                backend.state.lock().unwrap().apply_remote_player(
+                    player,
+                    queue.unwrap_or_default(),
+                    devices.unwrap_or_default(),
+                );
+            }
+        }
     }
     Ok(backend.snapshot_async().await)
 }
@@ -306,6 +369,7 @@ async fn play_playlist(
     backend: State<'_, Backend>,
     playlist_idx: usize,
 ) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     let info = {
         let st = backend.state.lock().unwrap();
         st.playlists
@@ -357,6 +421,7 @@ async fn play_in_context(
     track_ids: Vec<usize>,
     track_id: usize,
 ) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     let (remote_uris, offset_uri) = {
         let mut st = backend.state.lock().unwrap();
         st.play_in_context(context_name, &track_ids, track_id);
@@ -389,6 +454,7 @@ async fn play_in_context(
 
 #[tauri::command]
 async fn toggle_play(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     let now_playing = {
         let mut st = backend.state.lock().unwrap();
         st.toggle_play();
@@ -424,12 +490,14 @@ async fn toggle_play(backend: State<'_, Backend>) -> Result<StateSnapshot, Strin
 
 #[tauri::command]
 async fn next_track(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     backend.state.lock().unwrap().next_track();
     if let Some(tok) = backend.token_if_connected().await {
         if let Err(e) = backend.client.next(&tok).await {
             backend.set_error(Some(e));
         } else {
             backend.set_error(None);
+            tokio::time::sleep(Duration::from_millis(300)).await;
             backend.sync_player_only(&tok).await;
         }
     }
@@ -438,12 +506,14 @@ async fn next_track(backend: State<'_, Backend>) -> Result<StateSnapshot, String
 
 #[tauri::command]
 async fn prev_track(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     backend.state.lock().unwrap().prev_track();
     if let Some(tok) = backend.token_if_connected().await {
         if let Err(e) = backend.client.previous(&tok).await {
             backend.set_error(Some(e));
         } else {
             backend.set_error(None);
+            tokio::time::sleep(Duration::from_millis(300)).await;
             backend.sync_player_only(&tok).await;
         }
     }
@@ -452,6 +522,7 @@ async fn prev_track(backend: State<'_, Backend>) -> Result<StateSnapshot, String
 
 #[tauri::command]
 async fn seek_ratio(backend: State<'_, Backend>, ratio: f32) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     let ms = {
         let mut st = backend.state.lock().unwrap();
         st.seek_ratio(ratio);
@@ -465,6 +536,7 @@ async fn seek_ratio(backend: State<'_, Backend>, ratio: f32) -> Result<StateSnap
 
 #[tauri::command]
 async fn seek_secs(backend: State<'_, Backend>, secs: f32) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     let ms = {
         let mut st = backend.state.lock().unwrap();
         st.seek_secs(secs);
@@ -478,6 +550,7 @@ async fn seek_secs(backend: State<'_, Backend>, secs: f32) -> Result<StateSnapsh
 
 #[tauri::command]
 async fn toggle_shuffle(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     let enabled = {
         let mut st = backend.state.lock().unwrap();
         st.shuffle = !st.shuffle;
@@ -491,6 +564,7 @@ async fn toggle_shuffle(backend: State<'_, Backend>) -> Result<StateSnapshot, St
 
 #[tauri::command]
 async fn cycle_repeat(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     let mode = {
         let mut st = backend.state.lock().unwrap();
         st.repeat = st.repeat.cycle();
@@ -504,6 +578,7 @@ async fn cycle_repeat(backend: State<'_, Backend>) -> Result<StateSnapshot, Stri
 
 #[tauri::command]
 async fn set_volume(backend: State<'_, Backend>, volume: f32) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     let (vol, pct) = {
         let mut st = backend.state.lock().unwrap();
         st.set_volume(volume);
@@ -523,6 +598,7 @@ async fn set_volume(backend: State<'_, Backend>, volume: f32) -> Result<StateSna
 
 #[tauri::command]
 async fn toggle_mute(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     let (vol, pct) = {
         let mut st = backend.state.lock().unwrap();
         st.toggle_mute();

@@ -52,6 +52,8 @@ const ui = {
   rightPanel: "now_playing", // now_playing | queue | null
   lastLyricKey: "",
   fetchedLyricsIds: new Set(),
+  actionSeq: 0,
+  syncInFlight: false,
   lastErrorShown: null,
   loginBusy: false,
   openPopover: null, // menu | bell | friends | avatar | create | sort | devices | ctx | null
@@ -792,6 +794,13 @@ function surfaceBackendError() {
 }
 
 async function callBackend(cmd, args = {}) {
+  ui.actionSeq += 1;
+  // Instant 0ms optimistic flip for Play/Pause so icon never lags behind click
+  if (cmd === "toggle_play" && snap) {
+    snap.is_playing = !snap.is_playing;
+    renderPlayerBar();
+    document.querySelectorAll(".eq-bars").forEach((el) => el.classList.toggle("paused", !snap.is_playing));
+  }
   try {
     snap = await invoke(cmd, args);
     renderAll();
@@ -1861,17 +1870,24 @@ async function boot() {
     }
   }, 250);
 
-  // Live Spotify Connect sync every 3s when logged in
+  // Live Spotify Connect sync every 1.5s when logged in (drops stale in-flight responses)
   setInterval(async () => {
-    if (!snap?.spotify?.connected) return;
+    if (!snap?.spotify?.connected || ui.syncInFlight) return;
+    ui.syncInFlight = true;
+    const seqBefore = ui.actionSeq;
     try {
       const prevKey = `${currentTrack()?.spotify_id}:${snap.is_playing}:${snap.spotify.active_device}:${snap.spotify.audio_running}`;
-      snap = await invoke("spotify_sync_player");
+      const nextSnap = await invoke("spotify_sync_player");
+      if (ui.actionSeq !== seqBefore) return;
+      snap = nextSnap;
       const nextKey = `${currentTrack()?.spotify_id}:${snap.is_playing}:${snap.spotify.active_device}:${snap.spotify.audio_running}`;
       if (prevKey !== nextKey) renderAll();
       else updateProgressUI();
-    } catch (_) {}
-  }, 3000);
+    } catch (_) {
+    } finally {
+      ui.syncInFlight = false;
+    }
+  }, 1500);
 }
 
 boot();

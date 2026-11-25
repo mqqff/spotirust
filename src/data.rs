@@ -396,6 +396,38 @@ impl AppState {
         self.search_result_ids = ids;
     }
 
+    pub fn apply_remote_player_fast(&mut self, player: Option<RemotePlayer>) -> bool {
+        let prev_sp_id = self.current_track().and_then(|t| t.spotify_id.clone());
+        if let Some(p) = player {
+            self.is_playing = p.is_playing;
+            self.position_secs = p.position_secs;
+            self.shuffle = p.shuffle;
+            self.repeat = RepeatMode::from_spotify_str(&p.repeat);
+            self.volume = p.volume.clamp(0.0, 1.0);
+            self.muted = self.volume <= 0.001;
+            self.spotify.active_device = p.device_name;
+            self.last_tick = Instant::now();
+
+            if let Some(cur) = p.track {
+                let changed = prev_sp_id.as_deref() != Some(cur.spotify_id.as_str());
+                let cur_id = self.upsert_remote_track(cur, None);
+                if changed || self.queue.is_empty() {
+                    if let Some(pos) = self.queue.iter().position(|&id| id == cur_id) {
+                        self.queue_pos = pos;
+                    } else {
+                        self.queue.insert(0, cur_id);
+                        self.queue_pos = 0;
+                    }
+                }
+                return changed;
+            }
+        } else {
+            self.is_playing = false;
+            self.last_tick = Instant::now();
+        }
+        false
+    }
+
     pub fn apply_remote_player(
         &mut self,
         player: Option<RemotePlayer>,
