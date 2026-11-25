@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use librespot::{
-    connect::{ConnectConfig, Spirc},
+    connect::{ConnectConfig, LoadRequest, LoadRequestOptions, PlayingTrack, Spirc},
     core::{
         authentication::Credentials,
         cache::Cache,
@@ -18,6 +18,7 @@ use librespot::{
 };
 use tokio::task::JoinHandle;
 
+use crate::data::RepeatMode;
 use crate::spotify::LocalConfig;
 
 const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
@@ -25,6 +26,7 @@ const OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
 pub struct AudioEngine {
     spirc: Option<Spirc>,
     task: Option<JoinHandle<()>>,
+    loaded: bool,
 }
 
 impl Default for AudioEngine {
@@ -32,6 +34,7 @@ impl Default for AudioEngine {
         Self {
             spirc: None,
             task: None,
+            loaded: false,
         }
     }
 }
@@ -60,6 +63,7 @@ impl AudioEngine {
             if handle.is_finished() {
                 self.task = None;
                 self.spirc = None;
+                self.loaded = false;
                 false
             } else {
                 true
@@ -67,6 +71,10 @@ impl AudioEngine {
         } else {
             false
         }
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
     }
 
     pub async fn start(&mut self, interactive_auth: bool) -> Result<bool, String> {
@@ -146,6 +154,7 @@ impl AudioEngine {
 
         self.spirc = Some(spirc);
         self.task = Some(handle);
+        self.loaded = false;
         Ok(true)
     }
 
@@ -156,11 +165,64 @@ impl AudioEngine {
         if let Some(handle) = self.task.take() {
             handle.abort();
         }
+        self.loaded = false;
     }
 
     pub fn clear_cache(&mut self) {
         self.stop();
         let _ = std::fs::remove_file(Self::cache_root().join("credentials.json"));
+    }
+
+    pub fn load_tracks(
+        &mut self,
+        uris: Vec<String>,
+        offset_uri: Option<String>,
+        seek_ms: u32,
+    ) -> Result<(), String> {
+        let Some(spirc) = &self.spirc else {
+            return Err("Built-in Speaker belum aktif.".into());
+        };
+        let _ = spirc.activate();
+        let req = LoadRequest::from_tracks(
+            uris,
+            LoadRequestOptions {
+                start_playing: true,
+                seek_to: seek_ms,
+                playing_track: offset_uri.map(PlayingTrack::Uri),
+                ..LoadRequestOptions::default()
+            },
+        );
+        spirc
+            .load(req)
+            .map_err(|e| format!("Gagal memutar lagu di Built-in Speaker: {e}"))?;
+        self.loaded = true;
+        Ok(())
+    }
+
+    pub fn load_context(&mut self, context_uri: String) -> Result<(), String> {
+        let Some(spirc) = &self.spirc else {
+            return Err("Built-in Speaker belum aktif.".into());
+        };
+        let _ = spirc.activate();
+        let req = LoadRequest::from_context_uri(
+            context_uri,
+            LoadRequestOptions {
+                start_playing: true,
+                ..LoadRequestOptions::default()
+            },
+        );
+        spirc
+            .load(req)
+            .map_err(|e| format!("Gagal memutar playlist di Built-in Speaker: {e}"))?;
+        self.loaded = true;
+        Ok(())
+    }
+
+    pub fn play(&self) {
+        if let Some(spirc) = &self.spirc {
+            let _ = spirc.activate();
+            let _ = spirc.play();
+        }
     }
 
     pub fn pause(&self) {
@@ -169,9 +231,46 @@ impl AudioEngine {
         }
     }
 
-    pub fn play(&self) {
+    pub fn next(&self) {
         if let Some(spirc) = &self.spirc {
-            let _ = spirc.play();
+            let _ = spirc.next();
+        }
+    }
+
+    pub fn prev(&self) {
+        if let Some(spirc) = &self.spirc {
+            let _ = spirc.prev();
+        }
+    }
+
+    pub fn seek_ms(&self, ms: u32) {
+        if let Some(spirc) = &self.spirc {
+            let _ = spirc.set_position_ms(ms);
+        }
+    }
+
+    pub fn set_shuffle(&self, enabled: bool) {
+        if let Some(spirc) = &self.spirc {
+            let _ = spirc.shuffle(enabled);
+        }
+    }
+
+    pub fn set_repeat(&self, mode: RepeatMode) {
+        if let Some(spirc) = &self.spirc {
+            match mode {
+                RepeatMode::Off => {
+                    let _ = spirc.repeat(false);
+                    let _ = spirc.repeat_track(false);
+                }
+                RepeatMode::All => {
+                    let _ = spirc.repeat(true);
+                    let _ = spirc.repeat_track(false);
+                }
+                RepeatMode::One => {
+                    let _ = spirc.repeat(false);
+                    let _ = spirc.repeat_track(true);
+                }
+            }
         }
     }
 

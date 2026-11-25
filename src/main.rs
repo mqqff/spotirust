@@ -223,17 +223,22 @@ async fn audio_toggle(backend: State<'_, Backend>) -> Result<StateSnapshot, Stri
             return Err(e);
         }
         backend.set_error(None);
-        // Wait for SpotiRust Connect device to register, then transfer playback to it
+        backend.state.lock().unwrap().spotify.active_device = Some("SpotiRust".into());
+        // Try transferring existing playback if Spotify already sees the SpotiRust device
         if let Some(tok) = backend.token_if_connected().await {
-            for _ in 0..8 {
+            for _ in 0..4 {
                 if let Some(dev_id) = backend.client.find_device_id(&tok, "SpotiRust").await {
                     let _ = backend.client.transfer_playback(&tok, &dev_id).await;
-                    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(400)).await;
             }
             backend.sync_player_only(&tok).await;
+            let mut st = backend.state.lock().unwrap();
+            if st.spotify.active_device.is_none() {
+                st.spotify.active_device = Some("SpotiRust".into());
+            }
         }
     }
     Ok(backend.snapshot_async().await)
@@ -256,11 +261,15 @@ async fn spotify_sync_player(backend: State<'_, Backend>) -> Result<StateSnapsho
         {
             return Ok(backend.snapshot_async().await);
         }
-        let track_changed = backend
-            .state
-            .lock()
-            .unwrap()
-            .apply_remote_player_fast(player.clone());
+        let track_changed = {
+            let mut st = backend.state.lock().unwrap();
+            // If Built-in Speaker is running locally and Web API returns 204 idle, don't clobber local state
+            if player.is_none() && backend.audio.try_lock().is_ok_and(|mut a| a.is_running()) {
+                false
+            } else {
+                st.apply_remote_player_fast(player.clone())
+            }
+        };
         let n = backend.poll_count.fetch_add(1, Ordering::Relaxed);
         if track_changed || n % 4 == 0 {
             let (queue, devices) = tokio::join!(
@@ -380,27 +389,56 @@ async fn play_playlist(
         return Ok(backend.snapshot_async().await);
     };
 
-    if let (Some(pid), Some(tok)) = (sp_id, backend.token_if_connected().await) {
+    if let Some(pid) = sp_id {
         let ctx_uri = format!("spotify:playlist:{pid}");
-        let dev_id = backend.builtin_device_id(&tok).await;
-        match backend
-            .client
-            .play_context_uri(&tok, &ctx_uri, dev_id.as_deref())
-            .await
-        {
-            Ok(()) => {
-                {
-                    let mut st = backend.state.lock().unwrap();
-                    st.active_context_name = name;
-                    st.is_playing = true;
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() {
+            match eng.load_context(ctx_uri) {
+                Ok(()) => {
+                    drop(eng);
+                    {
+                        let mut st = backend.state.lock().unwrap();
+                        st.active_context_name = name;
+                        st.is_playing = true;
+                        st.spotify.active_device = Some("SpotiRust".into());
+                    }
+                    backend.set_error(None);
+                    if let Some(tok) = backend.token_if_connected().await {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        backend.sync_player_only(&tok).await;
+                    }
                 }
-                backend.set_error(None);
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                backend.sync_player_only(&tok).await;
+                Err(e) => {
+                    drop(eng);
+                    backend.state.lock().unwrap().is_playing = false;
+                    backend.set_error(Some(e));
+                }
             }
-            Err(e) => {
-                backend.state.lock().unwrap().is_playing = false;
-                backend.set_error(Some(e));
+            return Ok(backend.snapshot_async().await);
+        }
+        drop(eng);
+
+        if let Some(tok) = backend.token_if_connected().await {
+            let dev_id = backend.builtin_device_id(&tok).await;
+            match backend
+                .client
+                .play_context_uri(&tok, &ctx_uri, dev_id.as_deref())
+                .await
+            {
+                Ok(()) => {
+                    {
+                        let mut st = backend.state.lock().unwrap();
+                        st.active_context_name = name;
+                        st.is_playing = true;
+                    }
+                    backend.set_error(None);
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    backend.sync_player_only(&tok).await;
+                }
+                Err(e) => {
+                    backend.state.lock().unwrap().is_playing = false;
+                    backend.set_error(Some(e));
+                }
             }
         }
     } else if !local_ids.is_empty() {
@@ -435,6 +473,24 @@ async fn play_in_context(
     };
 
     if !remote_uris.is_empty() {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() {
+            match eng.load_tracks(remote_uris, offset_uri, 0) {
+                Ok(()) => {
+                    drop(eng);
+                    backend.state.lock().unwrap().spotify.active_device = Some("SpotiRust".into());
+                    backend.set_error(None);
+                }
+                Err(e) => {
+                    drop(eng);
+                    backend.state.lock().unwrap().is_playing = false;
+                    backend.set_error(Some(e));
+                }
+            }
+            return Ok(backend.snapshot_async().await);
+        }
+        drop(eng);
+
         if let Some(tok) = backend.token_if_connected().await {
             let dev_id = backend.builtin_device_id(&tok).await;
             if let Err(e) = backend
@@ -455,21 +511,52 @@ async fn play_in_context(
 #[tauri::command]
 async fn toggle_play(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
     backend.mark_user_action();
-    let now_playing = {
+    let (now_playing, queue_uris, cur_uri, pos_ms) = {
         let mut st = backend.state.lock().unwrap();
         st.toggle_play();
-        st.is_playing
+        let uris: Vec<String> = st
+            .queue
+            .iter()
+            .filter_map(|&id| st.tracks.get(id)?.uri.clone())
+            .take(50)
+            .collect();
+        let cur = st.current_track().and_then(|t| t.uri.clone());
+        let ms = (st.position_secs * 1000.0).max(0.0) as u32;
+        (st.is_playing, uris, cur, ms)
     };
+
     {
         let mut eng = backend.audio.lock().await;
         if eng.is_running() {
             if now_playing {
-                eng.play();
+                if eng.is_loaded() {
+                    eng.play();
+                    backend.set_error(None);
+                } else if !queue_uris.is_empty() {
+                    match eng.load_tracks(queue_uris, cur_uri, pos_ms) {
+                        Ok(()) => {
+                            backend.state.lock().unwrap().spotify.active_device =
+                                Some("SpotiRust".into());
+                            backend.set_error(None);
+                        }
+                        Err(e) => {
+                            backend.state.lock().unwrap().is_playing = false;
+                            backend.set_error(Some(e));
+                        }
+                    }
+                } else {
+                    eng.play();
+                    backend.set_error(None);
+                }
             } else {
                 eng.pause();
+                backend.set_error(None);
             }
+            drop(eng);
+            return Ok(backend.snapshot_async().await);
         }
     }
+
     if let Some(tok) = backend.token_if_connected().await {
         let res = if now_playing {
             backend.client.resume(&tok).await
@@ -492,6 +579,15 @@ async fn toggle_play(backend: State<'_, Backend>) -> Result<StateSnapshot, Strin
 async fn next_track(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
     backend.mark_user_action();
     backend.state.lock().unwrap().next_track();
+    {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() && eng.is_loaded() {
+            eng.next();
+            drop(eng);
+            backend.set_error(None);
+            return Ok(backend.snapshot_async().await);
+        }
+    }
     if let Some(tok) = backend.token_if_connected().await {
         if let Err(e) = backend.client.next(&tok).await {
             backend.set_error(Some(e));
@@ -508,6 +604,15 @@ async fn next_track(backend: State<'_, Backend>) -> Result<StateSnapshot, String
 async fn prev_track(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
     backend.mark_user_action();
     backend.state.lock().unwrap().prev_track();
+    {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() && eng.is_loaded() {
+            eng.prev();
+            drop(eng);
+            backend.set_error(None);
+            return Ok(backend.snapshot_async().await);
+        }
+    }
     if let Some(tok) = backend.token_if_connected().await {
         if let Err(e) = backend.client.previous(&tok).await {
             backend.set_error(Some(e));
@@ -528,6 +633,14 @@ async fn seek_ratio(backend: State<'_, Backend>, ratio: f32) -> Result<StateSnap
         st.seek_ratio(ratio);
         (st.position_secs * 1000.0) as u64
     };
+    {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() && eng.is_loaded() {
+            eng.seek_ms(ms as u32);
+            drop(eng);
+            return Ok(backend.snapshot_async().await);
+        }
+    }
     if let Some(tok) = backend.token_if_connected().await {
         let _ = backend.client.seek(&tok, ms).await;
     }
@@ -542,6 +655,14 @@ async fn seek_secs(backend: State<'_, Backend>, secs: f32) -> Result<StateSnapsh
         st.seek_secs(secs);
         (st.position_secs * 1000.0) as u64
     };
+    {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() && eng.is_loaded() {
+            eng.seek_ms(ms as u32);
+            drop(eng);
+            return Ok(backend.snapshot_async().await);
+        }
+    }
     if let Some(tok) = backend.token_if_connected().await {
         let _ = backend.client.seek(&tok, ms).await;
     }
@@ -556,6 +677,14 @@ async fn toggle_shuffle(backend: State<'_, Backend>) -> Result<StateSnapshot, St
         st.shuffle = !st.shuffle;
         st.shuffle
     };
+    {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() {
+            eng.set_shuffle(enabled);
+            drop(eng);
+            return Ok(backend.snapshot_async().await);
+        }
+    }
     if let Some(tok) = backend.token_if_connected().await {
         let _ = backend.client.set_shuffle(&tok, enabled).await;
     }
@@ -570,6 +699,14 @@ async fn cycle_repeat(backend: State<'_, Backend>) -> Result<StateSnapshot, Stri
         st.repeat = st.repeat.cycle();
         st.repeat
     };
+    {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() {
+            eng.set_repeat(mode);
+            drop(eng);
+            return Ok(backend.snapshot_async().await);
+        }
+    }
     if let Some(tok) = backend.token_if_connected().await {
         let _ = backend.client.set_repeat(&tok, mode.as_spotify_str()).await;
     }
@@ -588,6 +725,8 @@ async fn set_volume(backend: State<'_, Backend>, volume: f32) -> Result<StateSna
         let mut eng = backend.audio.lock().await;
         if eng.is_running() {
             eng.set_volume_ratio(vol);
+            drop(eng);
+            return Ok(backend.snapshot_async().await);
         }
     }
     if let Some(tok) = backend.token_if_connected().await {
@@ -612,6 +751,8 @@ async fn toggle_mute(backend: State<'_, Backend>) -> Result<StateSnapshot, Strin
         let mut eng = backend.audio.lock().await;
         if eng.is_running() {
             eng.set_volume_ratio(vol);
+            drop(eng);
+            return Ok(backend.snapshot_async().await);
         }
     }
     if let Some(tok) = backend.token_if_connected().await {
@@ -639,17 +780,27 @@ async fn toggle_like(backend: State<'_, Backend>, track_id: usize) -> Result<Sta
 
 #[tauri::command]
 async fn jump_queue(backend: State<'_, Backend>, idx: usize) -> Result<StateSnapshot, String> {
+    backend.mark_user_action();
     let uri = {
         let mut st = backend.state.lock().unwrap();
         st.jump_queue(idx);
         st.current_track().and_then(|t| t.uri.clone())
     };
-    if let (Some(u), Some(tok)) = (uri, backend.token_if_connected().await) {
-        let dev_id = backend.builtin_device_id(&tok).await;
-        let _ = backend
-            .client
-            .play_uris(&tok, vec![u], None, dev_id.as_deref())
-            .await;
+    if let Some(u) = uri {
+        let mut eng = backend.audio.lock().await;
+        if eng.is_running() {
+            let _ = eng.load_tracks(vec![u.clone()], Some(u), 0);
+            drop(eng);
+            return Ok(backend.snapshot_async().await);
+        }
+        drop(eng);
+        if let Some(tok) = backend.token_if_connected().await {
+            let dev_id = backend.builtin_device_id(&tok).await;
+            let _ = backend
+                .client
+                .play_uris(&tok, vec![u], None, dev_id.as_deref())
+                .await;
+        }
     }
     Ok(backend.snapshot_async().await)
 }
