@@ -2,12 +2,14 @@
 
 mod audio;
 mod data;
+mod lyrics;
 mod spotify;
 
 use std::sync::Mutex;
 
 use audio::AudioEngine;
 use data::{AppState, StateSnapshot};
+use lyrics::LyricsClient;
 use spotify::{LocalConfig, SpotifyClient};
 use tauri::State;
 
@@ -16,6 +18,7 @@ struct Backend {
     cfg: Mutex<LocalConfig>,
     audio: tokio::sync::Mutex<AudioEngine>,
     client: SpotifyClient,
+    lyrics: LyricsClient,
 }
 
 impl Backend {
@@ -29,6 +32,7 @@ impl Backend {
             cfg: Mutex::new(cfg),
             audio: tokio::sync::Mutex::new(AudioEngine::default()),
             client: SpotifyClient::default(),
+            lyrics: LyricsClient::default(),
         }
     }
 
@@ -84,6 +88,13 @@ impl Backend {
         st.load_spotify_library(profile, playlists, liked, recent);
         st.apply_remote_player(player, queue, devices);
         Ok(())
+    }
+
+    async fn builtin_device_id(&self, token: &str) -> Option<String> {
+        if !self.audio.lock().await.is_running() {
+            return None;
+        }
+        self.client.find_device_id(token, "SpotiRust").await
     }
 
     async fn sync_player_only(&self, token: &str) {
@@ -181,8 +192,16 @@ async fn audio_toggle(backend: State<'_, Backend>) -> Result<StateSnapshot, Stri
             return Err(e);
         }
         backend.set_error(None);
+        // Wait for SpotiRust Connect device to register, then transfer playback to it
         if let Some(tok) = backend.token_if_connected().await {
-            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            for _ in 0..8 {
+                if let Some(dev_id) = backend.client.find_device_id(&tok, "SpotiRust").await {
+                    let _ = backend.client.transfer_playback(&tok, &dev_id).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
             backend.sync_player_only(&tok).await;
         }
     }
@@ -263,6 +282,75 @@ async fn spotify_transfer_device(
 }
 
 #[tauri::command]
+async fn fetch_lyrics(backend: State<'_, Backend>) -> Result<StateSnapshot, String> {
+    let target = {
+        let st = backend.state.lock().unwrap();
+        st.current_track().and_then(|t| {
+            let key = AppState::lyrics_key(t);
+            if t.spotify_id.is_some() && !st.has_cached_lyrics(&key) {
+                Some((key, t.clone()))
+            } else {
+                None
+            }
+        })
+    };
+    if let Some((key, track)) = target {
+        let lines = backend.lyrics.fetch_for_track(&track).await;
+        backend.state.lock().unwrap().set_lyrics(key, lines);
+    }
+    Ok(backend.snapshot_async().await)
+}
+
+#[tauri::command]
+async fn play_playlist(
+    backend: State<'_, Backend>,
+    playlist_idx: usize,
+) -> Result<StateSnapshot, String> {
+    let info = {
+        let st = backend.state.lock().unwrap();
+        st.playlists
+            .get(playlist_idx)
+            .map(|p| (p.spotify_id.clone(), p.name.clone(), p.track_ids.clone()))
+    };
+    let Some((sp_id, name, local_ids)) = info else {
+        return Ok(backend.snapshot_async().await);
+    };
+
+    if let (Some(pid), Some(tok)) = (sp_id, backend.token_if_connected().await) {
+        let ctx_uri = format!("spotify:playlist:{pid}");
+        let dev_id = backend.builtin_device_id(&tok).await;
+        match backend
+            .client
+            .play_context_uri(&tok, &ctx_uri, dev_id.as_deref())
+            .await
+        {
+            Ok(()) => {
+                {
+                    let mut st = backend.state.lock().unwrap();
+                    st.active_context_name = name;
+                    st.is_playing = true;
+                }
+                backend.set_error(None);
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                backend.sync_player_only(&tok).await;
+            }
+            Err(e) => {
+                backend.state.lock().unwrap().is_playing = false;
+                backend.set_error(Some(e));
+            }
+        }
+    } else if !local_ids.is_empty() {
+        let first = local_ids[0];
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .play_in_context(name, &local_ids, first);
+    }
+    Ok(backend.snapshot_async().await)
+}
+
+#[tauri::command]
 async fn play_in_context(
     backend: State<'_, Backend>,
     context_name: String,
@@ -283,7 +371,12 @@ async fn play_in_context(
 
     if !remote_uris.is_empty() {
         if let Some(tok) = backend.token_if_connected().await {
-            if let Err(e) = backend.client.play_uris(&tok, remote_uris, offset_uri).await {
+            let dev_id = backend.builtin_device_id(&tok).await;
+            if let Err(e) = backend
+                .client
+                .play_uris(&tok, remote_uris, offset_uri, dev_id.as_deref())
+                .await
+            {
                 backend.state.lock().unwrap().is_playing = false;
                 backend.set_error(Some(e));
             } else {
@@ -476,7 +569,11 @@ async fn jump_queue(backend: State<'_, Backend>, idx: usize) -> Result<StateSnap
         st.current_track().and_then(|t| t.uri.clone())
     };
     if let (Some(u), Some(tok)) = (uri, backend.token_if_connected().await) {
-        let _ = backend.client.play_uris(&tok, vec![u], None).await;
+        let dev_id = backend.builtin_device_id(&tok).await;
+        let _ = backend
+            .client
+            .play_uris(&tok, vec![u], None, dev_id.as_deref())
+            .await;
     }
     Ok(backend.snapshot_async().await)
 }
@@ -612,6 +709,8 @@ fn main() {
             spotify_load_playlist,
             spotify_search,
             spotify_transfer_device,
+            fetch_lyrics,
+            play_playlist,
             play_in_context,
             toggle_play,
             next_track,

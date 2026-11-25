@@ -157,6 +157,7 @@ pub struct AppState {
     pub search_result_ids: Vec<usize>,
     pub spotify: SpotifyStatus,
     spotify_track_index: HashMap<String, usize>,
+    lyrics_cache: HashMap<String, Vec<LyricLine>>,
     last_tick: Instant,
 }
 
@@ -183,6 +184,7 @@ impl Default for AppState {
             search_result_ids: Vec::new(),
             spotify: SpotifyStatus::default(),
             spotify_track_index: HashMap::new(),
+            lyrics_cache: HashMap::new(),
             last_tick: Instant::now(),
         }
     }
@@ -207,9 +209,34 @@ fn palette_for(seed: &str) -> ([u8; 3], [u8; 3]) {
 }
 
 impl AppState {
+    pub fn lyrics_key(track: &Track) -> String {
+        track
+            .spotify_id
+            .clone()
+            .unwrap_or_else(|| format!("{}::{}", track.title, track.artist))
+    }
+
+    pub fn has_cached_lyrics(&self, key: &str) -> bool {
+        self.lyrics_cache.contains_key(key)
+    }
+
+    pub fn set_lyrics(&mut self, key: String, lines: Vec<LyricLine>) {
+        self.lyrics_cache.insert(key, lines);
+    }
+
     pub fn snapshot(&mut self) -> StateSnapshot {
         self.tick();
-        let lyrics = self.current_track().map(track_lyrics).unwrap_or_default();
+        let lyrics = self
+            .current_track()
+            .map(|t| {
+                let key = Self::lyrics_key(t);
+                if let Some(cached) = self.lyrics_cache.get(&key) {
+                    cached.clone()
+                } else {
+                    track_lyrics(t)
+                }
+            })
+            .unwrap_or_default();
         StateSnapshot {
             tracks: self.tracks.clone(),
             playlists: self.playlists.clone(),
@@ -632,20 +659,10 @@ impl AppState {
 
 pub fn track_lyrics(track: &Track) -> Vec<LyricLine> {
     if track.spotify_id.is_some() {
-        return vec![
-            LyricLine {
-                time_secs: 0.0,
-                text: format!("{} — {}", track.title, track.artist),
-            },
-            LyricLine {
-                time_secs: 8.0,
-                text: "Live lyrics are not provided by the official Spotify Web API.".into(),
-            },
-            LyricLine {
-                time_secs: 16.0,
-                text: format!("Album: {}", track.album),
-            },
-        ];
+        return vec![LyricLine {
+            time_secs: 0.0,
+            text: format!("Loading lyrics for {} — {}...", track.title, track.artist),
+        }];
     }
 
     let raw: Vec<&str> = match track.id {

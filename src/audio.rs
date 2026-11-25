@@ -95,6 +95,9 @@ impl AudioEngine {
             let token = tokio::task::spawn_blocking(move || {
                 OAuthClientBuilder::new(&client_id, OAUTH_REDIRECT_URI, vec!["streaming"])
                     .open_in_browser()
+                    .with_custom_message(
+                        "Built-in Speaker SpotiRust berhasil diotorisasi! Silakan tutup tab ini dan kembali ke aplikasi SpotiRust.",
+                    )
                     .build()
                     .map_err(|e| format!("Audio OAuth build error: {e}"))?
                     .get_access_token()
@@ -136,8 +139,10 @@ impl AudioEngine {
                 .await
                 .map_err(|e| format!("Gagal menyalakan built-in Spotify audio engine: {e}"))?;
 
-        let _ = spirc.activate();
         let handle = tokio::spawn(spirc_task);
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        let _ = spirc.activate();
+        let _ = spirc.transfer(None);
 
         self.spirc = Some(spirc);
         self.task = Some(handle);

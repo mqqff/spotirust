@@ -707,32 +707,82 @@ impl SpotifyClient {
             .map(|d| d.id.clone())
     }
 
+    pub async fn find_device_id(&self, token: &str, name: &str) -> Option<String> {
+        let devices = self.fetch_devices(token).await.ok()?;
+        devices
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(name))
+            .map(|d| d.id.clone())
+    }
+
+    pub async fn play_context_uri(
+        &self,
+        token: &str,
+        context_uri: &str,
+        device_id: Option<&str>,
+    ) -> Result<(), String> {
+        let body = json!({ "context_uri": context_uri });
+        let url = match device_id {
+            Some(id) => format!(
+                "https://api.spotify.com/v1/me/player/play?device_id={}",
+                url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>()
+            ),
+            None => "https://api.spotify.com/v1/me/player/play".to_string(),
+        };
+        let (status, val) = self
+            .api_request(token, Method::PUT, &url, Some(body.clone()))
+            .await?;
+        if status == 404 {
+            if let Some(dev_id) = self.pick_preferred_device(token).await {
+                let retry_url = format!(
+                    "https://api.spotify.com/v1/me/player/play?device_id={}",
+                    url::form_urlencoded::byte_serialize(dev_id.as_bytes()).collect::<String>()
+                );
+                let (s2, v2) = self
+                    .api_request(token, Method::PUT, &retry_url, Some(body))
+                    .await?;
+                if s2 >= 400 {
+                    return Err(extract_api_error(s2, &v2));
+                }
+                return Ok(());
+            }
+            return Err("Tidak ada device Spotify aktif. Aktifkan Built-in Speaker di ikon Device atau buka Spotify di HP/Web.".into());
+        }
+        if status >= 400 {
+            return Err(extract_api_error(status, &val));
+        }
+        Ok(())
+    }
+
     pub async fn play_uris(
         &self,
         token: &str,
         uris: Vec<String>,
         offset_uri: Option<String>,
+        device_id: Option<&str>,
     ) -> Result<(), String> {
         let mut body = json!({ "uris": uris });
         if let Some(uri) = offset_uri {
             body["offset"] = json!({ "uri": uri });
         }
+        let url = match device_id {
+            Some(id) => format!(
+                "https://api.spotify.com/v1/me/player/play?device_id={}",
+                url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>()
+            ),
+            None => "https://api.spotify.com/v1/me/player/play".to_string(),
+        };
         let (status, val) = self
-            .api_request(
-                token,
-                Method::PUT,
-                "https://api.spotify.com/v1/me/player/play",
-                Some(body.clone()),
-            )
+            .api_request(token, Method::PUT, &url, Some(body.clone()))
             .await?;
         if status == 404 {
             if let Some(dev_id) = self.pick_preferred_device(token).await {
-                let url = format!(
+                let retry_url = format!(
                     "https://api.spotify.com/v1/me/player/play?device_id={}",
                     url::form_urlencoded::byte_serialize(dev_id.as_bytes()).collect::<String>()
                 );
                 let (s2, v2) = self
-                    .api_request(token, Method::PUT, &url, Some(body))
+                    .api_request(token, Method::PUT, &retry_url, Some(body))
                     .await?;
                 if s2 >= 400 {
                     return Err(extract_api_error(s2, &v2));

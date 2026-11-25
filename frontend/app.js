@@ -51,6 +51,7 @@ const ui = {
   libCollapsed: false,
   rightPanel: "now_playing", // now_playing | queue | null
   lastLyricKey: "",
+  fetchedLyricsIds: new Set(),
   lastErrorShown: null,
   loginBusy: false,
   openPopover: null, // menu | bell | friends | avatar | create | sort | devices | ctx | null
@@ -181,7 +182,11 @@ function renderTopBar() {
   const sp = snap.spotify;
   connBtn.classList.toggle("connected", sp.connected);
   if (sp.connected) {
-    const label = sp.active_device || (sp.audio_running ? "SpotiRust" : "Spotify");
+    const label = sp.audio_running
+      ? sp.active_device && sp.active_device.toLowerCase() !== "spotirust"
+        ? `${sp.active_device} • Built-in ON`
+        : "SpotiRust (Built-in)"
+      : sp.active_device || "Spotify";
     connBtn.innerHTML = `<span class="status-dot"></span><span>${esc(label)}</span>`;
     connBtn.title = "Spotify Connected • Switch device / Built-in audio";
   } else {
@@ -364,11 +369,15 @@ function renderMain() {
 
       html += `<div class="quick-grid">`;
       quick.forEach((q) => {
+        const playAttr =
+          q.idx !== undefined
+            ? `data-play-playlist="${q.idx}"`
+            : `data-quick-play="${esc(q.title)}" data-ids="${q.ids.join(",")}"`;
         html += `
           <div class="quick-tile" data-nav="${q.nav}" ${q.idx !== undefined ? `data-idx="${q.idx}"` : ""}>
             ${coverHTML(q.pri, q.acc, 48, { isLiked: q.isLiked, imageUrl: q.imageUrl })}
             <span class="quick-tile-title">${esc(q.title)}</span>
-            <button class="float-play" data-quick-play="${esc(q.title)}" data-ids="${q.ids.join(",")}" title="Play">${ICONS.play(14)}</button>
+            <button class="float-play" ${playAttr} title="Play">${ICONS.play(14)}</button>
           </div>`;
       });
       html += `</div>`;
@@ -389,7 +398,7 @@ function renderMain() {
             <div class="shelf-card" data-nav="playlist" data-idx="${idx}">
               <div class="shelf-cover-wrap">
                 ${coverHTML(p.primary_rgb, p.accent_rgb, 160, { full: true, shadowed: true, mark: true, imageUrl: p.image_url })}
-                <button class="float-play" data-quick-play="${esc(p.name)}" data-ids="${p.track_ids.join(",")}" title="Play">${ICONS.play(18)}</button>
+                <button class="float-play" data-play-playlist="${idx}" title="Play">${ICONS.play(18)}</button>
               </div>
               <div class="shelf-card-title">${esc(p.name)}</div>
               <div class="shelf-card-desc">${esc(p.description || `By ${p.creator}`)}</div>
@@ -452,11 +461,17 @@ function renderMain() {
     const acc = isLiked ? [45, 212, 191] : p.accent_rgb;
     const heroImg = isLiked ? null : p.image_url;
     const isLoadingPlaylist = !isLiked && snap.spotify.connected && !p.loaded;
-    const isCtxPlaying = snap.is_playing && JSON.stringify(snap.queue) === JSON.stringify(ids) && ids.length > 0;
+    const isCtxPlaying =
+      snap.is_playing &&
+      ((ids.length > 0 && JSON.stringify(snap.queue) === JSON.stringify(ids)) ||
+        (!isLiked && snap.active_context_name === title));
+    const heroPlayAttrs = !isLiked
+      ? `data-play-playlist="${ui.view.index}" data-playing="${isCtxPlaying ? "1" : "0"}"`
+      : `data-hero-play="${esc(title)}" data-ids="${ids.join(",")}"`;
 
     stickyBar.style.background = `rgb(${Math.round(pri[0] * 0.36 + 14)},${Math.round(pri[1] * 0.36 + 14)},${Math.round(pri[2] * 0.36 + 14)})`;
     stickyBar.innerHTML = `
-      <button class="sticky-play-btn" data-hero-play="${esc(title)}" data-ids="${ids.join(",")}">
+      <button class="sticky-play-btn" ${heroPlayAttrs}>
         ${isCtxPlaying ? ICONS.pause(18) : ICONS.play(18)}
       </button>
       <div class="sticky-title">${esc(title)}</div>`;
@@ -485,7 +500,7 @@ function renderMain() {
       </div>
       <div class="action-bar">
         <div class="action-left">
-          <button class="hero-play-btn" data-hero-play="${esc(title)}" data-ids="${ids.join(",")}">
+          <button class="hero-play-btn" ${heroPlayAttrs}>
             ${isCtxPlaying ? ICONS.pause(22) : ICONS.play(22)}
           </button>
           <button class="icon-btn" data-action="shuffle" title="Shuffle" style="${snap.shuffle ? "color:var(--green)" : ""}">${ICONS.shuffle(22)}</button>
@@ -742,6 +757,20 @@ function updateProgressUI() {
   }
 }
 
+function maybeFetchLyrics() {
+  const t = currentTrack();
+  if (!t?.spotify_id) return;
+  if (ui.fetchedLyricsIds.has(t.spotify_id)) return;
+  ui.fetchedLyricsIds.add(t.spotify_id);
+  invoke("fetch_lyrics")
+    .then((nextSnap) => {
+      snap = nextSnap;
+      renderNowPlaying();
+      if (ui.view.kind === "lyrics") renderMain();
+    })
+    .catch(() => {});
+}
+
 function renderAll() {
   if (!snap) return;
   renderTopBar();
@@ -749,6 +778,7 @@ function renderAll() {
   renderMain();
   renderNowPlaying();
   renderPlayerBar();
+  maybeFetchLyrics();
 }
 
 function surfaceBackendError() {
@@ -868,7 +898,7 @@ function showToast(msg) {
   el.textContent = msg;
   el.classList.remove("hidden");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.add("hidden"), 2400);
+  toastTimer = setTimeout(() => el.classList.add("hidden"), 4200);
 }
 
 function closePopover() {
@@ -1450,17 +1480,8 @@ function wireEvents() {
     const playPlBtn = e.target.closest("[data-ctx-play-pl]");
     if (playPlBtn) {
       const idx = Number(playPlBtn.dataset.ctxPlayPl);
-      const p = snap.playlists[idx];
       closePopover();
-      if (p && p.track_ids.length) {
-        callBackend("play_in_context", {
-          contextName: p.name,
-          trackIds: p.track_ids,
-          trackId: p.track_ids[0],
-        });
-      } else {
-        showToast("Playlist masih kosong");
-      }
+      callBackend("play_playlist", { playlistIdx: idx });
       return;
     }
 
@@ -1589,6 +1610,17 @@ function wireEvents() {
     if (likeBtn) {
       e.stopPropagation();
       callBackend("toggle_like", { trackId: Number(likeBtn.dataset.like) });
+      return;
+    }
+
+    const playPlaylistBtn = e.target.closest("[data-play-playlist]");
+    if (playPlaylistBtn) {
+      e.stopPropagation();
+      if (playPlaylistBtn.dataset.playing === "1") {
+        callBackend("toggle_play");
+      } else {
+        callBackend("play_playlist", { playlistIdx: Number(playPlaylistBtn.dataset.playPlaylist) });
+      }
       return;
     }
 
@@ -1833,9 +1865,9 @@ async function boot() {
   setInterval(async () => {
     if (!snap?.spotify?.connected) return;
     try {
-      const prevKey = `${currentTrack()?.spotify_id}:${snap.is_playing}:${snap.spotify.active_device}`;
+      const prevKey = `${currentTrack()?.spotify_id}:${snap.is_playing}:${snap.spotify.active_device}:${snap.spotify.audio_running}`;
       snap = await invoke("spotify_sync_player");
-      const nextKey = `${currentTrack()?.spotify_id}:${snap.is_playing}:${snap.spotify.active_device}`;
+      const nextKey = `${currentTrack()?.spotify_id}:${snap.is_playing}:${snap.spotify.active_device}:${snap.spotify.audio_running}`;
       if (prevKey !== nextKey) renderAll();
       else updateProgressUI();
     } catch (_) {}
